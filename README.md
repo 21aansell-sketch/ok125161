@@ -80,7 +80,7 @@ Blur image previews and disable embed media in NSFW channels.
 ## Local Edit
 Edit messages locally.
 
-> https://21aansell-sketch.github.io/revengeplugin/localedit
+> https://21aansell-sketch.github.io/ok125161/localedit
 <h3>
 <details>
   <summary>Preview</summary>
