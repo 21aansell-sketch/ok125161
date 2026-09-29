@@ -1,3 +1,6 @@
+# not my code i used AI to fix just local edit it currently isnt "fixed" it still doesnt work
+
+
 # シグマ siguma's revenge/bunny/kettu plugins.
 A few vendetta plugins have been forked and are being maintained to work with it's successors [Revenge](https://github.com/revenge-mod/revenge-bundle),[Kettu](https://github.com/C0C0B01/Kettu)). Credit goes to the plugin devs for their respective work.
 
