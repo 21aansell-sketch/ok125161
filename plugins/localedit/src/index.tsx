@@ -6,87 +6,253 @@ import { Forms } from "@vendetta/ui/components";
 import { findInReactTree } from "@vendetta/utils";
 
 const LazyActionSheet = findByProps("openLazy", "hideActionSheet");
-const ActionSheetRow = findByProps("ActionSheetRow")?.ActionSheetRow ?? Forms.FormRow;
+const ActionSheetRow =
+    findByProps("ActionSheetRow")?.ActionSheetRow ?? Forms.FormRow;
+
 const MessageStore = findByStoreName("MessageStore");
 const UserStore = findByStoreName("UserStore");
-const Messages = findByProps("sendMessage", "startEditMessage", "editMessage");
+
+// Discord 345009 still exposes the message editing actions through
+// the message-actions module, but don't crash the plugin if Discord
+// changes the module shape.
+const Messages = findByProps(
+    "sendMessage",
+    "startEditMessage",
+    "endEditMessage",
+);
 
 const edits = new Map<string, any>();
+
 let isEditing = false;
 let patches: (() => void)[] = [];
 
 export default {
     onLoad() {
-        patches.push(before("openLazy", LazyActionSheet, ([component, key, msg]) => {
-            const message = msg?.message;
-            if (key !== "MessageLongPressActionSheet" || !message) return;
+        if (!LazyActionSheet || !MessageStore || !UserStore || !Messages) {
+            console.warn(
+                "[LocalMessageEditor] Required Discord modules were not found."
+            );
+            return;
+        }
 
-            component.then(instance => {
-                const unpatch = after("default", instance, (_, res) => {
-                    setTimeout(unpatch, 0);
+        /*
+         * Add "Edit Locally" to the message long-press menu.
+         */
+        patches.push(
+            before(
+                "openLazy",
+                LazyActionSheet,
+                ([component, key, msg]) => {
+                    const message = msg?.message;
 
-                    const buttons = findInReactTree(res, x => x?.[0]?.type?.name === "ActionSheetRow");
-                    if (!buttons) return;
+                    if (
+                        key !== "MessageLongPressActionSheet" ||
+                        !message
+                    ) {
+                        return;
+                    }
 
-                    const currentUser = UserStore.getCurrentUser();
-                    const currentMessage = MessageStore.getMessage(message.channel_id, message.id) ?? message;
+                    component.then((instance: any) => {
+                        if (!instance) return;
 
-                    if (currentMessage.author.id === currentUser.id) return;
+                        const unpatch = after(
+                            "default",
+                            instance,
+                            (_args: any[], res: any) => {
+                                setTimeout(unpatch, 0);
 
-                    if (buttons.some(b => b?.props?.label === "Edit Locally")) return;
+                                const buttons = findInReactTree(
+                                    res,
+                                    (x: any) =>
+                                        x?.[0]?.type?.name ===
+                                        "ActionSheetRow",
+                                );
 
-                    const position = Math.max(buttons.findIndex((x: any) => x.props.message === i18n.Messages.MARK_UNREAD), 0);
+                                if (!buttons) return;
 
-                    const handleEdit = () => {
-                        isEditing = true;
-                        if (!edits.has(currentMessage.id)) {
-                            edits.set(currentMessage.id, JSON.parse(JSON.stringify(currentMessage)));
-                        }
-                        LazyActionSheet.hideActionSheet();
-                        Messages.startEditMessage(currentMessage.channel_id, currentMessage.id, currentMessage.content);
-                    };
+                                const currentUser =
+                                    UserStore.getCurrentUser();
 
-                    buttons.splice(position, 0, (
-                        <ActionSheetRow
-                            label="Edit Locally"
-                            icon={<ActionSheetRow.Icon source={getAssetIDByName("ic_edit_24px")} />}
-                            onPress={handleEdit}
-                        />
-                    ));
-                });
-            });
-        }));
+                                const currentMessage =
+                                    MessageStore.getMessage(
+                                        message.channel_id,
+                                        message.id,
+                                    ) ?? message;
 
-        patches.push(before("editMessage", Messages, (args) => {
-            const [channelId, messageId, message] = args;
+                                if (!currentMessage?.author?.id) return;
 
-            if (isEditing) {
-                const baseMessage = edits.get(messageId);
-                if (!baseMessage) return;
+                                // Don't offer the option for your own messages.
+                                if (
+                                    currentUser &&
+                                    currentMessage.author.id ===
+                                        currentUser.id
+                                ) {
+                                    return;
+                                }
 
-                FluxDispatcher.dispatch({
-                    type: "MESSAGE_UPDATE",
-                    message: {
-                        ...baseMessage,
-                        content: message.content,
-                        edited_timestamp: null,
+                                if (
+                                    buttons.some(
+                                        (b: any) =>
+                                            b?.props?.label ===
+                                            "Edit Locally",
+                                    )
+                                ) {
+                                    return;
+                                }
+
+                                const unreadIndex = buttons.findIndex(
+                                    (x: any) =>
+                                        x?.props?.message ===
+                                        i18n.Messages.MARK_UNREAD,
+                                );
+
+                                const position =
+                                    unreadIndex >= 0
+                                        ? unreadIndex
+                                        : buttons.length;
+
+                                const handleEdit = () => {
+                                    isEditing = true;
+
+                                    /*
+                                     * Keep a copy of the original message.
+                                     */
+                                    if (!edits.has(currentMessage.id)) {
+                                        edits.set(
+                                            currentMessage.id,
+                                            JSON.parse(
+                                                JSON.stringify(
+                                                    currentMessage,
+                                                ),
+                                            ),
+                                        );
+                                    }
+
+                                    LazyActionSheet.hideActionSheet();
+
+                                    /*
+                                     * Open Discord's normal editor.
+                                     *
+                                     * We intercept the actual edit call
+                                     * below, so Discord never receives the
+                                     * edited message.
+                                     */
+                                    Messages.startEditMessage(
+                                        currentMessage.channel_id,
+                                        currentMessage.id,
+                                        currentMessage.content ?? "",
+                                    );
+                                };
+
+                                buttons.splice(
+                                    position,
+                                    0,
+                                    (
+                                        <ActionSheetRow
+                                            label="Edit Locally"
+                                            icon={
+                                                <ActionSheetRow.Icon
+                                                    source={getAssetIDByName(
+                                                        "ic_edit_24px",
+                                                    )}
+                                                />
+                                            }
+                                            onPress={handleEdit}
+                                        />
+                                    ),
+                                );
+                            },
+                        );
+                    });
+                },
+            ),
+        );
+
+        /*
+         * Intercept Discord's edit operation.
+         *
+         * The original message is saved locally, then a local
+         * MESSAGE_UPDATE is dispatched instead of sending the edit
+         * to Discord.
+         */
+        patches.push(
+            before(
+                "editMessage",
+                Messages,
+                (args: any[]) => {
+                    const [channelId, messageId, message] = args;
+
+                    if (!isEditing) return;
+
+                    const baseMessage = edits.get(messageId);
+
+                    if (!baseMessage) {
+                        isEditing = false;
+                        return;
+                    }
+
+                    FluxDispatcher.dispatch({
+                        type: "MESSAGE_UPDATE",
+                        message: {
+                            ...baseMessage,
+
+                            channel_id: channelId,
+                            id: messageId,
+
+                            content:
+                                typeof message === "string"
+                                    ? message
+                                    : message?.content ??
+                                      baseMessage.content,
+
+                            /*
+                             * Don't show Discord's normal edited state.
+                             */
+                            edited_timestamp: null,
+                        },
+
+                        /*
+                         * Prevent other plugins from treating this as
+                         * a normal Discord message edit.
+                         */
+                        otherPluginBypass: true,
+                    });
+
+                    /*
+                     * Returning false prevents the original
+                     * editMessage function from executing.
+                     */
+                    return false;
+                },
+            ),
+        );
+
+        /*
+         * Discord calls this when the normal message editor closes.
+         */
+        if (typeof Messages.endEditMessage === "function") {
+            patches.push(
+                after(
+                    "endEditMessage",
+                    Messages,
+                    () => {
+                        isEditing = false;
                     },
-                    otherPluginBypass:true,
-                });
-                return false;
-            }
-        }));
-
-        patches.push(after("endEditMessage", Messages, () => {
-            if (isEditing) {
-                isEditing = false;
-            }
-        }));
+                ),
+            );
+        }
     },
 
     onUnload() {
-        patches.forEach(p => p());
+        patches.forEach((unpatch) => {
+            try {
+                unpatch();
+            } catch {}
+        });
+
         patches = [];
+
         edits.clear();
-    }
+        isEditing = false;
+    },
 };
