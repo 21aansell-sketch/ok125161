@@ -20,7 +20,6 @@ type Patch = () => void;
 
 /*
  * Discord changes its internal module exports fairly frequently.
- *
  * Keep discovery property-based rather than depending on numeric module IDs
  * or a particular Discord build.
  */
@@ -35,15 +34,14 @@ const ActionSheetModule =
 
 const ActionSheetRow =
     ActionSheetModule?.ActionSheetRow ??
-    Forms.FormRow;
+    Forms?.FormRow;
 
 const MessageStore = findByStoreName("MessageStore");
 const UserStore = findByStoreName("UserStore");
 
 /*
  * Newer Discord builds have changed the exact set of exports exposed by
- * their message-actions module. Try the complete set first, then progressively
- * weaker property matches.
+ * their message-actions module. Try several property combinations.
  */
 const Messages =
     findByProps("sendMessage", "startEditMessage", "editMessage") ??
@@ -57,10 +55,41 @@ let editingMessageId: string | null = null;
 
 let patches: Patch[] = [];
 
+/**
+ * Diagnostic logging.
+ *
+ * This makes it possible to distinguish:
+ * 1. Manifest/plugin never loaded
+ * 2. Plugin loaded but an API is missing
+ * 3. Plugin loaded successfully but the action-sheet patch isn't firing
+ */
+function logDiagnostics(): void {
+    console.log("[LocalEdit] API discovery:", {
+        LazyActionSheet: !!LazyActionSheet,
+        openLazy: !!LazyActionSheet?.openLazy,
+        hideActionSheet: !!LazyActionSheet?.hideActionSheet,
+
+        ActionSheetModule: !!ActionSheetModule,
+        ActionSheetRow: !!ActionSheetRow,
+
+        MessageStore: !!MessageStore,
+        getMessage: !!MessageStore?.getMessage,
+
+        UserStore: !!UserStore,
+        getCurrentUser: !!UserStore?.getCurrentUser,
+
+        Messages: !!Messages,
+        startEditMessage: !!Messages?.startEditMessage,
+        editMessage: !!Messages?.editMessage,
+        endEditMessage: !!Messages?.endEditMessage,
+    });
+}
+
 function getCurrentUser(): any {
     try {
         return UserStore?.getCurrentUser?.();
-    } catch {
+    } catch (error) {
+        console.warn("[LocalEdit] Failed to get current user:", error);
         return null;
     }
 }
@@ -68,16 +97,16 @@ function getCurrentUser(): any {
 function getMessage(channelId: string, messageId: string): Message | null {
     try {
         return MessageStore?.getMessage?.(channelId, messageId) ?? null;
-    } catch {
+    } catch (error) {
+        console.warn("[LocalEdit] Failed to get message:", error);
         return null;
     }
 }
 
 function cloneMessage(message: Message): Message {
     /*
-     * Discord message objects are plain serialisable objects in the relevant
-     * store path. structuredClone is preferable when available, but retain
-     * JSON as a compatibility fallback.
+     * Discord message objects are generally serialisable along this path.
+     * structuredClone is preferable when available.
      */
     try {
         if (typeof structuredClone === "function")
@@ -91,12 +120,8 @@ function cloneMessage(message: Message): Message {
 
 function getActionSheetRows(tree: any): any[] | null {
     /*
-     * The old implementation depended on:
-     *
-     *   x?.[0]?.type?.name === "ActionSheetRow"
-     *
-     * That is unnecessarily strict and can break when Discord wraps the
-     * component differently.
+     * Discord can wrap the action-sheet rows differently between builds.
+     * Don't depend exclusively on a particular React component name.
      */
     return findInReactTree(tree, (node: any) => {
         if (!Array.isArray(node) || !node.length)
@@ -145,8 +170,12 @@ function findInsertPosition(rows: any[]): number {
 }
 
 function beginLocalEdit(message: Message): void {
-    if (!Messages?.startEditMessage)
+    if (!Messages?.startEditMessage) {
+        console.warn("[LocalEdit] startEditMessage API not found");
         return;
+    }
+
+    console.log("[LocalEdit] Beginning local edit:", message.id);
 
     isEditing = true;
     editingMessageId = message.id;
@@ -157,26 +186,42 @@ function beginLocalEdit(message: Message): void {
     try {
         LazyActionSheet?.hideActionSheet?.();
     } catch {
-        // Discord changed the action-sheet implementation; continue anyway.
+        // Discord changed the action-sheet implementation.
     }
 
     /*
-     * This invokes Discord's native edit composer. The editMessage patch below
-     * prevents the resulting edit from reaching Discord's remote API.
+     * This invokes Discord's native edit composer.
+     *
+     * The editMessage patch below prevents the resulting edit from
+     * reaching Discord's remote API.
      */
-    Messages.startEditMessage(
-        message.channel_id,
-        message.id,
-        message.content ?? ""
-    );
+    try {
+        Messages.startEditMessage(
+            message.channel_id,
+            message.id,
+            message.content ?? ""
+        );
+    } catch (error) {
+        console.error("[LocalEdit] startEditMessage failed:", error);
+
+        isEditing = false;
+        editingMessageId = null;
+    }
 }
 
 export default {
     onLoad() {
         /*
-         * Guard against a partially incompatible Discord build. The plugin
-         * should fail gracefully rather than preventing Revenge from loading
-         * other plugins.
+         * IMPORTANT:
+         * If this message appears in the console, the manifest successfully
+         * loaded the plugin and execution reached index.tsx.
+         */
+        console.log("[LocalEdit] onLoad reached");
+
+        logDiagnostics();
+
+        /*
+         * Guard against a partially incompatible Discord build.
          */
         if (!LazyActionSheet?.openLazy) {
             console.warn("[LocalEdit] ActionSheet API not found");
@@ -193,6 +238,13 @@ export default {
             return;
         }
 
+        if (!ActionSheetRow) {
+            console.warn("[LocalEdit] ActionSheetRow/FormRow not found");
+            return;
+        }
+
+        console.log("[LocalEdit] Required APIs found");
+
         /*
          * Add "Edit Locally" to the message long-press action sheet.
          */
@@ -200,99 +252,154 @@ export default {
             before(
                 "openLazy",
                 LazyActionSheet,
-                ([component, key, msg]: any[]) => {
-                    if (key !== "MessageLongPressActionSheet")
+                (args: any[]) => {
+                    /*
+                     * Log the arguments so we can see whether Discord changed
+                     * the openLazy signature.
+                     */
+                    console.log("[LocalEdit] openLazy called:", args);
+
+                    const [component, key, msg] = args;
+
+                    if (key !== "MessageLongPressActionSheet") {
                         return;
+                    }
+
+                    console.log(
+                        "[LocalEdit] MessageLongPressActionSheet detected"
+                    );
 
                     const originalMessage: Message | undefined =
                         msg?.message;
 
-                    if (!originalMessage)
+                    if (!originalMessage) {
+                        console.warn(
+                            "[LocalEdit] No message found in action-sheet args"
+                        );
                         return;
+                    }
 
                     /*
-                     * Discord loads this action sheet lazily. Patch the
-                     * resulting component rather than relying on its module
-                     * internals.
+                     * Discord loads this action sheet lazily.
                      */
-                    if (!component?.then)
+                    if (!component?.then) {
+                        console.warn(
+                            "[LocalEdit] Action-sheet component is not a Promise"
+                        );
                         return;
+                    }
 
                     component.then((instance: any) => {
-                        if (!instance)
+                        if (!instance) {
+                            console.warn(
+                                "[LocalEdit] Lazy action-sheet resolved to nothing"
+                            );
                             return;
+                        }
 
                         let unpatch: Patch | undefined;
 
-                        unpatch = after(
-                            "default",
-                            instance,
-                            (_args: any[], result: any) => {
-                                /*
-                                 * Only patch this particular render.
-                                 */
-                                setTimeout(() => {
-                                    try {
-                                        unpatch?.();
-                                    } catch {
-                                        // Already removed.
+                        try {
+                            unpatch = after(
+                                "default",
+                                instance,
+                                (_args: any[], result: any) => {
+                                    /*
+                                     * Only patch this particular render.
+                                     */
+                                    setTimeout(() => {
+                                        try {
+                                            unpatch?.();
+                                        } catch {
+                                            // Already removed.
+                                        }
+                                    }, 0);
+
+                                    const rows = getActionSheetRows(result);
+
+                                    if (!rows) {
+                                        console.warn(
+                                            "[LocalEdit] Could not find action-sheet rows"
+                                        );
+                                        return;
                                     }
-                                }, 0);
 
-                                const rows = getActionSheetRows(result);
+                                    console.log(
+                                        "[LocalEdit] Found action-sheet rows:",
+                                        rows.length
+                                    );
 
-                                if (!rows)
-                                    return;
+                                    const currentUser = getCurrentUser();
 
-                                const currentUser = getCurrentUser();
+                                    if (!currentUser?.id) {
+                                        console.warn(
+                                            "[LocalEdit] Could not determine current user"
+                                        );
+                                        return;
+                                    }
 
-                                if (!currentUser?.id)
-                                    return;
+                                    const currentMessage =
+                                        getMessage(
+                                            originalMessage.channel_id,
+                                            originalMessage.id
+                                        ) ?? originalMessage;
 
-                                const currentMessage =
-                                    getMessage(
-                                        originalMessage.channel_id,
-                                        originalMessage.id
-                                    ) ?? originalMessage;
+                                    /*
+                                     * Preserve the original behavior:
+                                     * users cannot locally edit their own messages
+                                     * through this menu item.
+                                     */
+                                    if (
+                                        currentMessage.author?.id ===
+                                        currentUser.id
+                                    ) {
+                                        console.log(
+                                            "[LocalEdit] Message belongs to current user; skipping"
+                                        );
+                                        return;
+                                    }
 
-                                /*
-                                 * Preserve the original behavior:
-                                 * users cannot locally edit their own messages
-                                 * through this menu item.
-                                 */
-                                if (
-                                    currentMessage.author?.id ===
-                                    currentUser.id
-                                ) {
-                                    return;
+                                    if (hasLocalEditButton(rows)) {
+                                        return;
+                                    }
+
+                                    const position =
+                                        findInsertPosition(rows);
+
+                                    console.log(
+                                        "[LocalEdit] Inserting Edit Locally at:",
+                                        position
+                                    );
+
+                                    rows.splice(
+                                        position,
+                                        0,
+                                        <ActionSheetRow
+                                            label="Edit Locally"
+                                            icon={
+                                                ActionSheetRow?.Icon ? (
+                                                    <ActionSheetRow.Icon
+                                                        source={getAssetIDByName(
+                                                            "ic_edit_24px"
+                                                        )}
+                                                    />
+                                                ) : undefined
+                                            }
+                                            onPress={() =>
+                                                beginLocalEdit(
+                                                    currentMessage
+                                                )
+                                            }
+                                        />
+                                    );
                                 }
-
-                                if (hasLocalEditButton(rows))
-                                    return;
-
-                                const position = findInsertPosition(rows);
-
-                                rows.splice(
-                                    position,
-                                    0,
-                                    <ActionSheetRow
-                                        label="Edit Locally"
-                                        icon={
-                                            ActionSheetRow?.Icon ? (
-                                                <ActionSheetRow.Icon
-                                                    source={getAssetIDByName(
-                                                        "ic_edit_24px"
-                                                    )}
-                                                />
-                                            ) : undefined
-                                        }
-                                        onPress={() =>
-                                            beginLocalEdit(currentMessage)
-                                        }
-                                    />
-                                );
-                            }
-                        );
+                            );
+                        } catch (error) {
+                            console.error(
+                                "[LocalEdit] Failed to patch action-sheet render:",
+                                error
+                            );
+                        }
                     });
                 }
             )
@@ -302,55 +409,68 @@ export default {
          * Intercept Discord's normal edit operation.
          *
          * The composer is still Discord's own composer, but when the user
-         * confirms an edit while Local Edit is active, we dispatch a local
+         * confirms an edit while Local Edit is active, dispatch a local
          * MESSAGE_UPDATE instead of allowing the remote edit operation.
          */
         if (Messages?.editMessage) {
             patches.push(
-                before("editMessage", Messages, (args: any[]) => {
-                    const [channelId, messageId, message] = args;
+                before(
+                    "editMessage",
+                    Messages,
+                    (args: any[]) => {
+                        const [channelId, messageId, message] = args;
 
-                    if (!isEditing)
-                        return;
+                        if (!isEditing)
+                            return;
 
-                    if (
-                        !editingMessageId ||
-                        messageId !== editingMessageId
-                    ) {
-                        return;
+                        if (
+                            !editingMessageId ||
+                            messageId !== editingMessageId
+                        ) {
+                            return;
+                        }
+
+                        const baseMessage = edits.get(messageId);
+
+                        if (!baseMessage)
+                            return;
+
+                        console.log(
+                            "[LocalEdit] Intercepting edit:",
+                            messageId
+                        );
+
+                        FluxDispatcher.dispatch({
+                            type: "MESSAGE_UPDATE",
+                            message: {
+                                ...baseMessage,
+                                channel_id: channelId,
+                                content:
+                                    typeof message === "string"
+                                        ? message
+                                        : message?.content ??
+                                          baseMessage.content ??
+                                          "",
+                                /*
+                                 * A local edit should not display Discord's
+                                 * normal remote-edited state.
+                                 */
+                                edited_timestamp: null,
+                            },
+                            otherPluginBypass: true,
+                        });
+
+                        /*
+                         * Returning false prevents the original editMessage
+                         * call from executing.
+                         */
+                        return false;
                     }
-
-                    const baseMessage = edits.get(messageId);
-
-                    if (!baseMessage)
-                        return;
-
-                    FluxDispatcher.dispatch({
-                        type: "MESSAGE_UPDATE",
-                        message: {
-                            ...baseMessage,
-                            channel_id: channelId,
-                            content:
-                                typeof message === "string"
-                                    ? message
-                                    : message?.content ??
-                                      baseMessage.content ??
-                                      "",
-                            /*
-                             * A local edit should not display Discord's
-                             * normal remote-edited state.
-                             */
-                            edited_timestamp: null,
-                        },
-                        otherPluginBypass: true,
-                    });
-
-                    /*
-                     * Returning false prevents the original editMessage call
-                     * from executing.
-                     */
-                    return false;
-                })
+                )
+            );
+        } else {
+            console.warn(
+                "[LocalEdit] editMessage API not found; remote edits will NOT be intercepted"
             );
         }
 
@@ -364,16 +484,27 @@ export default {
                     if (!isEditing)
                         return;
 
+                    console.log("[LocalEdit] Edit composer closed");
+
                     isEditing = false;
                     editingMessageId = null;
                 })
             );
+        } else {
+            console.warn(
+                "[LocalEdit] endEditMessage API not found"
+            );
         }
 
-        console.log("[LocalEdit] Loaded");
+        console.log(
+            "[LocalEdit] Loaded successfully. Patches:",
+            patches.length
+        );
     },
 
     onUnload() {
+        console.log("[LocalEdit] Unloading");
+
         for (const patch of patches) {
             try {
                 patch();
@@ -388,5 +519,7 @@ export default {
 
         isEditing = false;
         editingMessageId = null;
+
+        console.log("[LocalEdit] Unloaded");
     },
 };
